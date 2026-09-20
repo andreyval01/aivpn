@@ -285,10 +285,10 @@ impl AivpnServer {
 pub fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap()),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(false)
         .init();
 }
 

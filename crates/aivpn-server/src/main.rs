@@ -330,13 +330,13 @@ async fn main() {
         return;
     }
 
-    // Initialize logging (only for server mode)
+    // Default INFO. Per-packet DEBUG filled disks in production; use RUST_LOG=debug to opt in.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
         .init();
 
     info!("AIVPN Server v{}", env!("CARGO_PKG_VERSION"));
