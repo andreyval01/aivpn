@@ -3,6 +3,7 @@ pub mod socks5;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
 };
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -148,19 +149,35 @@ pub async fn spawn_proxy(
     let rx_clone = Arc::clone(&rx_queue);
     let tx_clone = Arc::clone(&tx_queue);
 
-    std::thread::spawn(move || {
-        run_stack(
-            rx_clone,
-            tx_clone,
-            tun_to_udp_tx,
-            cmd_rx,
-            udp_cmd_rx,
-            wake_rx,
-            vpn_ip,
-            gateway_ip,
-            prefix_len,
-        );
-    });
+    std::thread::Builder::new()
+        .name("aivpn-proxy-stack".into())
+        .spawn(move || {
+            supervise_proxy_stack(
+                || {
+                    run_stack(
+                        Arc::clone(&rx_clone),
+                        Arc::clone(&tx_clone),
+                        tun_to_udp_tx.clone(),
+                        &cmd_rx,
+                        &udp_cmd_rx,
+                        &wake_rx,
+                        vpn_ip,
+                        gateway_ip,
+                        prefix_len,
+                    );
+                },
+                || {
+                    recover_after_stack_panic(
+                        &rx_clone,
+                        &tx_clone,
+                        &cmd_rx,
+                        &udp_cmd_rx,
+                        &wake_rx,
+                    );
+                },
+            );
+        })
+        .expect("spawn aivpn-proxy-stack thread");
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!("SOCKS5 proxy listening on {}", config.listen_addr);
@@ -215,14 +232,72 @@ fn alloc_src_port() -> u16 {
     p
 }
 
+/// SOCKS proxy iface is IPv4-only. smoltcp 0.11 `get_source_address_ipv6`
+/// unwraps if we ask it to send IPv6 without an IPv6 CIDR on the iface.
+fn ipv4_endpoint(addr: SocketAddr) -> Option<IpEndpoint> {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            Some(IpEndpoint::new(IpAddress::v4(a, b, c, d), addr.port()))
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Run `body` until it returns. On panic, call `recover` and retry so SOCKS
+/// CONNECT keeps working without tearing down the VPN session.
+fn supervise_proxy_stack(mut body: impl FnMut(), mut recover: impl FnMut()) {
+    loop {
+        match catch_unwind(AssertUnwindSafe(&mut body)) {
+            Ok(()) => return,
+            Err(_) => {
+                error!(
+                    "smoltcp proxy stack panicked (IPv6 on an IPv4-only iface is a known trigger); restarting"
+                );
+                recover();
+            }
+        }
+    }
+}
+
+fn recover_after_stack_panic(
+    rx_queue: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    tx_queue: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    cmd_rx: &std::sync::mpsc::Receiver<NewConn>,
+    udp_cmd_rx: &std::sync::mpsc::Receiver<UdpStackCommand>,
+    wake_rx: &std::sync::mpsc::Receiver<()>,
+) {
+    if let Ok(mut q) = rx_queue.lock() {
+        q.clear();
+    }
+    if let Ok(mut q) = tx_queue.lock() {
+        q.clear();
+    }
+    while let Ok(nc) = cmd_rx.try_recv() {
+        let _ = nc.ready_tx.send(false);
+    }
+    while let Ok(cmd) = udp_cmd_rx.try_recv() {
+        match cmd {
+            UdpStackCommand::CreateAssoc(nc) => {
+                let _ = nc.ready_tx.send(false);
+            }
+            UdpStackCommand::Resolve(r) => {
+                let _ = r.reply.send(None);
+            }
+            UdpStackCommand::SendPacket(_) => {}
+        }
+    }
+    while wake_rx.try_recv().is_ok() {}
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_stack(
     rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     tun_to_udp_tx: mpsc::Sender<Vec<u8>>,
-    cmd_rx: std::sync::mpsc::Receiver<NewConn>,
-    udp_cmd_rx: std::sync::mpsc::Receiver<UdpStackCommand>,
-    wake_rx: std::sync::mpsc::Receiver<()>,
+    cmd_rx: &std::sync::mpsc::Receiver<NewConn>,
+    udp_cmd_rx: &std::sync::mpsc::Receiver<UdpStackCommand>,
+    wake_rx: &std::sync::mpsc::Receiver<()>,
     vpn_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     prefix_len: u8,
@@ -609,16 +684,6 @@ fn socket_endpoint_to_socket_addr(endpoint: IpEndpoint) -> SocketAddr {
     SocketAddr::new(ip, endpoint.port)
 }
 
-fn socket_addr_to_ip_endpoint(addr: SocketAddr) -> IpEndpoint {
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            let [a, b, c, d] = ip.octets();
-            IpEndpoint::new(IpAddress::v4(a, b, c, d), addr.port())
-        }
-        IpAddr::V6(ip) => IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(ip.octets())), addr.port()),
-    }
-}
-
 async fn handle_socks5(
     stream: tokio::net::TcpStream,
     cmd_tx: std::sync::mpsc::SyncSender<NewConn>,
@@ -971,9 +1036,17 @@ async fn handle_udp_associate(
                 }
             };
 
+            let Some(endpoint) = ipv4_endpoint(target_sock) else {
+                warn!(
+                    "SOCKS5 UDP: IPv6 targets not supported: {}",
+                    target_sock
+                );
+                continue;
+            };
+
             match udp_tx.try_send(UdpStackCommand::SendPacket(UdpPacketCommand {
                 relay_port,
-                target: socket_addr_to_ip_endpoint(target_sock),
+                target: endpoint,
                 payload: request.data,
             })) {
                 Ok(_) => {
@@ -1118,5 +1191,74 @@ mod tests {
             1,
             "relay socket fd must be released after abort"
         );
+    }
+
+    #[test]
+    fn ipv4_endpoint_rejects_v6() {
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let ep = ipv4_endpoint(v4).expect("v4");
+        assert_eq!(ep.port, 443);
+
+        let v6: SocketAddr = "[2001:4860:4860::8888]:53".parse().unwrap();
+        assert!(ipv4_endpoint(v6).is_none());
+    }
+
+    #[test]
+    fn supervise_proxy_stack_retries_after_panic() {
+        use std::sync::atomic::AtomicUsize;
+        let hits = AtomicUsize::new(0);
+        let recovered = AtomicUsize::new(0);
+        supervise_proxy_stack(
+            || {
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("test panic");
+                }
+            },
+            || {
+                recovered.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(recovered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recover_after_stack_panic_fails_pending_connect() {
+        let rx: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::from([
+            vec![0x60, 0, 0, 0],
+            vec![0x45, 0, 0, 0],
+        ])));
+        let tx: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::from([vec![1]])));
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<NewConn>(4);
+        let (udp_tx, udp_rx) = std::sync::mpsc::sync_channel::<UdpStackCommand>(4);
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(4);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        cmd_tx
+            .try_send(NewConn {
+                target: IpEndpoint::new(IpAddress::v4(1, 1, 1, 1), 443),
+                src_port: 1234,
+                inbound: Arc::new(Mutex::new(VecDeque::new())),
+                outbound_tx: tokio::sync::mpsc::channel::<Vec<u8>>(1).0,
+                close_flag: Arc::new(AtomicBool::new(false)),
+                ready_tx,
+            })
+            .unwrap();
+        let (dns_tx, dns_rx) = std::sync::mpsc::sync_channel::<Option<IpAddr>>(1);
+        udp_tx
+            .try_send(UdpStackCommand::Resolve(DnsResolve {
+                name: "example.com".into(),
+                qtype: DnsType::A,
+                reply: dns_tx,
+            }))
+            .unwrap();
+        let _ = wake_tx.try_send(());
+
+        recover_after_stack_panic(&rx, &tx, &cmd_rx, &udp_rx, &wake_rx);
+
+        assert!(rx.lock().unwrap().is_empty());
+        assert!(tx.lock().unwrap().is_empty());
+        assert_eq!(ready_rx.try_recv(), Ok(false));
+        assert_eq!(dns_rx.try_recv(), Ok(None));
+        assert!(wake_rx.try_recv().is_err());
     }
 }

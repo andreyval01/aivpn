@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **SOCKS `--proxy-listen` died after one IPv6 datagram and never recovered** — smoltcp 0.11 panics in `get_source_address_ipv6` (`Option::unwrap`) when `proto-ipv6` is on but the proxy iface only has an IPv4 address. Xray/v2rayTUN UDP ASSOCIATE (DNS AAAA, QUIC) and IPv6 CONNECT both feed that path. The stack thread unwound, dropping the SOCKS `NewConn` receiver; TCP CONNECT then returned general failure immediately while the VPN session kept rekeying, so the tunnel looked up and carried nothing. Observed on a dual `--proxy-listen` host: one SOCKS process panicked 2026-08-24 06:44 UTC, another on 2026-08-21 09:05 UTC; other inbounds still accepted clients. IPv6 is now dropped before it reaches smoltcp, and the stack thread is supervised so a future panic restarts it without tearing down the session.
+- **A second `aivpn-client` on the same host burned one CPU core at 100%** — both processes bind a hardcoded admin IPC UDP socket at `127.0.0.1:44301` (`record` CLI). The first instance takes the port; the second logs `Address already in use` and drops the `admin_tx` sender. The main `select!` then sees `admin_rx.recv()` as immediately ready (`None`) and spins forever. Observed on a dual `--proxy-listen` bridge: one core pinned for the life of the process (~7 MB of tunnel traffic). The daemon now scans `44301–44316` (or `--admin-listen` / `AIVPN_ADMIN_LISTEN`), writes the bound address next to the admin token so `record` still finds it, and parks if the channel closes instead of spinning.
+
 ## [1.0.5] - 2026-08-10
 
 ### Fixed

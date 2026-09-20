@@ -4,7 +4,107 @@
 //! by sending appropriate ControlPayload messages to the server.
 
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::net::SocketAddr;
 use tracing::{info, warn};
+
+/// Default local UDP port for `aivpn-client record` IPC.
+pub const DEFAULT_ADMIN_PORT: u16 = 44301;
+/// How many consecutive loopback ports to try after `DEFAULT_ADMIN_PORT`.
+pub const ADMIN_PORT_FALLBACKS: u16 = 16;
+
+/// Addresses the daemon will try for the admin IPC socket.
+///
+/// An explicit `preferred` address is tried alone (operator pin).
+/// The default scans `127.0.0.1:44301` .. `44316` so a second
+/// `--proxy-listen` instance on the same host can start without
+/// colliding with the first.
+pub fn admin_listen_candidates(preferred: Option<SocketAddr>) -> Vec<SocketAddr> {
+    match preferred {
+        Some(addr) => vec![addr],
+        None => (0..ADMIN_PORT_FALLBACKS)
+            .map(|i| SocketAddr::from(([127, 0, 0, 1], DEFAULT_ADMIN_PORT + i)))
+            .collect(),
+    }
+}
+
+fn admin_listen_path() -> std::path::PathBuf {
+    admin_ipc_dir().join("admin.listen")
+}
+
+fn admin_ipc_dir() -> std::path::PathBuf {
+    admin_token_path()
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+fn persist_admin_listen(addr: SocketAddr) {
+    let path = admin_listen_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    let body = addr.to_string();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(body.as_bytes()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+/// Address the running daemon bound for admin IPC. CLI `record` uses this
+/// so a fallback port (44302+) still receives commands.
+pub fn read_admin_listen() -> SocketAddr {
+    std::fs::read_to_string(admin_listen_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_ADMIN_PORT)))
+}
+
+/// Bind the admin IPC UDP socket, falling back to the next loopback ports
+/// when the default is already taken by another instance.
+pub async fn bind_admin_udp(preferred: Option<SocketAddr>) -> io::Result<tokio::net::UdpSocket> {
+    let candidates = admin_listen_candidates(preferred);
+    let mut last_err: Option<io::Error> = None;
+    for addr in candidates {
+        match tokio::net::UdpSocket::bind(addr).await {
+            Ok(socket) => {
+                persist_admin_listen(addr);
+                if addr.port() != DEFAULT_ADMIN_PORT {
+                    info!(
+                        "Admin IPC listening on {} ({} already in use)",
+                        addr,
+                        SocketAddr::from(([127, 0, 0, 1], DEFAULT_ADMIN_PORT))
+                    );
+                }
+                return Ok(socket);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrInUse, "no free admin IPC port")
+    }))
+}
 
 /// Returns platform-appropriate paths for recording status files.
 pub fn recording_status_paths() -> Vec<std::path::PathBuf> {
@@ -358,4 +458,49 @@ pub fn handle_recording_failed(reason: &str) {
     println!("   - Use the service for at least 1 minute");
     println!("   - Ensure active traffic (not idle)");
     println!("   - Need at least 500 packets captured");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn default_candidates_scan_loopback_range() {
+        let c = admin_listen_candidates(None);
+        assert_eq!(c.len(), ADMIN_PORT_FALLBACKS as usize);
+        assert_eq!(c[0], SocketAddr::from(([127, 0, 0, 1], DEFAULT_ADMIN_PORT)));
+        assert_eq!(
+            *c.last().unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], DEFAULT_ADMIN_PORT + ADMIN_PORT_FALLBACKS - 1))
+        );
+    }
+
+    #[test]
+    fn explicit_candidate_is_not_scanned() {
+        let pin = "127.0.0.1:19999".parse().unwrap();
+        assert_eq!(admin_listen_candidates(Some(pin)), vec![pin]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_and_read_admin_listen_roundtrip() {
+        let _guard = crate::TEST_HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-admin-listen-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        let addr: SocketAddr = "127.0.0.1:44307".parse().unwrap();
+        persist_admin_listen(addr);
+        assert_eq!(read_admin_listen(), addr);
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

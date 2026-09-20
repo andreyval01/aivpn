@@ -104,6 +104,11 @@ pub struct ClientArgs {
     #[arg(long, value_name = "HOST:PORT")]
     pub proxy_listen: Option<String>,
 
+    /// Local UDP address for `aivpn-client record` IPC (default 127.0.0.1:44301).
+    /// If omitted, a second instance automatically tries 44302–44316 when 44301 is busy.
+    #[arg(long, env = "AIVPN_ADMIN_LISTEN", value_name = "HOST:PORT")]
+    pub admin_listen: Option<String>,
+
     /// Path to a 104-byte mTLS client certificate (raw binary or base64-encoded).
     /// Required when the server has `mtls.required = true`.
     #[arg(long, value_name = "FILE")]
@@ -504,10 +509,11 @@ async fn main() {
                         aivpn_client::record_cmd::handle_recording_status(true, Some(&service));
                         let token =
                             aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
+                        let admin = aivpn_client::record_cmd::read_admin_listen();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
                             s.send_to(
                                 format!("{token}:record_start:{service}").as_bytes(),
-                                "127.0.0.1:44301",
+                                admin,
                             )
                             .map(|_| s)
                         }) {
@@ -525,8 +531,9 @@ async fn main() {
                         );
                         let token =
                             aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
+                        let admin = aivpn_client::record_cmd::read_admin_listen();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
-                            s.send_to(format!("{token}:record_stop").as_bytes(), "127.0.0.1:44301")
+                            s.send_to(format!("{token}:record_stop").as_bytes(), admin)
                                 .map(|_| s)
                         }) {
                             Ok(_) => {}
@@ -541,10 +548,11 @@ async fn main() {
                             .unwrap_or(0);
                         let token =
                             aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
+                        let admin = aivpn_client::record_cmd::read_admin_listen();
                         if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
                             let _ = socket.send_to(
                                 format!("{token}:record_status").as_bytes(),
-                                "127.0.0.1:44301",
+                                admin,
                             );
                         }
                         let start = std::time::Instant::now();
@@ -919,6 +927,12 @@ async fn main() {
         }
         addr
     });
+    let admin_listen = args.admin_listen.as_ref().map(|s| {
+        s.parse::<std::net::SocketAddr>().unwrap_or_else(|e| {
+            error!("Invalid --admin-listen '{}': {}", s, e);
+            std::process::exit(1);
+        })
+    });
     let mtls_cert: Option<Vec<u8>> = args.mtls_cert.as_ref().map(|path| {
         let raw = std::fs::read(path).unwrap_or_else(|e| {
             error!("Cannot read --mtls-cert '{}': {}", path.display(), e);
@@ -1241,6 +1255,7 @@ async fn main() {
             initial_mask,
             tun_config,
             proxy_listen,
+            admin_listen,
             mtls_cert: mtls_cert.clone(),
             initial_adaptive_level,
             polymorphic_base: args.polymorphic_base.clone(),

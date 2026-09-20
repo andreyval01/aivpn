@@ -44,7 +44,7 @@ use aivpn_common::mimicry::MimicryEngine;
 
 /// RAII guard that aborts a spawned task when dropped.
 /// Used to ensure the admin IPC socket task is cancelled when run() returns,
-/// so the next reconnect iteration can bind 127.0.0.1:44301 without
+/// so the next reconnect iteration can bind the admin UDP port without
 /// "Address already in use".
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
@@ -282,6 +282,10 @@ pub struct ClientConfig {
     pub tun_config: TunnelConfig,
     /// When set, run as SOCKS5 proxy on this address instead of a TUN device.
     pub proxy_listen: Option<std::net::SocketAddr>,
+    /// Optional pin for the local `record` CLI UDP socket. `None` tries
+    /// `127.0.0.1:44301` then the next 15 ports so two daemons on one host
+    /// do not collide.
+    pub admin_listen: Option<std::net::SocketAddr>,
     /// Optional 104-byte mTLS certificate sent to the server after session setup.
     /// Required when the server is configured with `mtls.required = true`.
     pub mtls_cert: Option<Vec<u8>>,
@@ -1196,11 +1200,12 @@ impl AivpnClient {
 
         // Spawn local IPC listener for CLI commands. Stored in AbortOnDrop so the task
         // (and its bound UDP socket) is cancelled when run() returns. Without this,
-        // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
+        // the orphaned task keeps the admin port bound across reconnect iterations,
         // causing the next run() call to fail with "Address already in use".
         let admin_token = crate::record_cmd::ensure_admin_token();
+        let admin_listen = self.config.admin_listen;
         let _admin_task = AbortOnDrop(tokio::spawn(async move {
-            match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
+            match crate::record_cmd::bind_admin_udp(admin_listen).await {
                 Ok(socket) => {
                     let mut buf = [0u8; 1024];
                     loop {
@@ -1224,10 +1229,11 @@ impl AivpnClient {
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to bind local admin UDP socket 127.0.0.1:44301: {}",
-                        e
-                    );
+                    error!("Failed to bind local admin UDP socket: {}", e);
+                    // Keep `admin_tx` alive. Dropping it closes `admin_rx` and the
+                    // main `select!` treats a closed channel as immediately ready
+                    // (`None`), spinning one core at 100%.
+                    std::future::pending::<()>().await;
                 }
             }
         }));
@@ -1625,7 +1631,13 @@ impl AivpnClient {
                 }
 
                 cmd = admin_rx.recv() => {
-                    if let Some(cmd) = cmd {
+                    let Some(cmd) = cmd else {
+                        // Closed admin channel would otherwise be immediately
+                        // ready forever and spin this select at 100% CPU.
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                    };
+                    {
                         if let Some(service) = cmd.strip_prefix("record_start:") {
                             crate::record_cmd::handle_recording_status(true, Some(service));
                             let payload = ControlPayload::RecordingStart { service: service.to_string() };
@@ -1953,6 +1965,11 @@ impl AivpnClient {
                     return Err(Error::InvalidPacket("Invalid IP version in payload"));
                 }
                 if let Some(h) = &self.proxy_handle {
+                    // Proxy smoltcp iface is IPv4-only. An IPv6 frame there
+                    // panics smoltcp 0.11 in `get_source_address_ipv6`.
+                    if ip_payload[0] >> 4 != 4 {
+                        return Ok(());
+                    }
                     {
                         let mut q = h.rx_queue.lock().unwrap_or_else(|e| e.into_inner());
                         // Bound the queue: drop-oldest past the cap so a stalled
@@ -3157,6 +3174,7 @@ mod tests {
             initial_mask: mask,
             tun_config: crate::tunnel::TunnelConfig::default(),
             proxy_listen: None,
+            admin_listen: None,
             mtls_cert: None,
             initial_adaptive_level: AdaptiveLevel::Off,
             polymorphic_base: None,
