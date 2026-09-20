@@ -2881,18 +2881,9 @@ impl Gateway {
                 // pass 1, so its handshake does exactly the work it did before.
                 // Only a handshake that no modern candidate explains — already
                 // rate-limited by the per-IP cooldown — pays for the second pass.
+                let mut handshake_rejected: Option<u8> = None;
                 'bootstrap: for legacy_framing in [false, true] {
                     for client_cfg in &clients {
-                        if !client_cfg.enabled {
-                            continue;
-                        }
-                        if client_cfg
-                            .expires_at
-                            .is_some_and(|t| t <= chrono::Utc::now())
-                        {
-                            continue;
-                        }
-
                         let psk = client_cfg.psk;
                         let candidate_masks = self
                             .bootstrap_descriptors
@@ -2974,6 +2965,43 @@ impl Gateway {
                                 Ok(sess) => {
                                     let validation = sess.lock().validate_handshake_tag(&cand_tag);
                                     if validation.is_some() {
+                                        let reject_reason: Option<u8> = if !client_cfg.enabled {
+                                            Some(3)
+                                        } else if client_cfg
+                                            .expires_at
+                                            .is_some_and(|t| t <= chrono::Utc::now())
+                                        {
+                                            Some(2)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(reason) = reject_reason {
+                                            let reason_str =
+                                                if reason == 3 { "disabled" } else { "expired" };
+                                            warn!(
+                                                "Handshake from {} matched PSK-proven client '{}' but it is {} — sending authenticated HandshakeReject",
+                                                hash_addr(&client_addr),
+                                                client_cfg.id,
+                                                reason_str
+                                            );
+                                            self.audit_log.log(
+                                                AuditActor::System,
+                                                "handshake_rejected",
+                                                &client_cfg.id,
+                                                reason_str,
+                                            );
+                                            sess.lock().mask = Some(bootstrap_mask.clone());
+                                            let _ = self
+                                                .send_control_message(
+                                                    &ControlPayload::HandshakeReject { reason },
+                                                    &sess,
+                                                )
+                                                .await;
+                                            let sid = sess.lock().session_id;
+                                            self.session_manager.rollback_failed_session(&sid);
+                                            handshake_rejected = Some(reason);
+                                            break 'bootstrap;
+                                        }
                                         // `mask_id` is `bootstrap:epoch-<N>:<base>:<slot>:<hex>`
                                         // for a covert descriptor mask, or a bare preset
                                         // name for the public-preset fallback. Surfacing
@@ -3049,6 +3077,14 @@ impl Gateway {
                 match found {
                     Some(f) => f,
                     None => {
+                        if let Some(reason) = handshake_rejected {
+                            debug!(
+                                "Handshake from {} concluded: authenticated HandshakeReject (reason {}) already sent",
+                                hash_addr(&client_addr),
+                                reason
+                            );
+                            return Ok(());
+                        }
                         // Track failed handshake for cooldown — but never for a
                         // peer whose session is still up (see `peer_has_session`).
                         if peer_has_session {
@@ -4039,6 +4075,17 @@ impl Gateway {
                     );
                     self.session_manager
                         .commit_session_rekey(&session_id, &new_eph_pub);
+                    // Send an immediate packet under the newly committed S2C
+                    // keys. Clients stage their C2S switch until a new-key
+                    // downlink proves commit; without this an idle client may
+                    // not receive any downlink before its next keepalive.
+                    let commit_ack = ControlPayload::ControlAck {
+                        ack_seq: 0,
+                        ack_for_subtype: aivpn_common::protocol::ControlSubtype::KeyRotate as u8,
+                    };
+                    if let Err(e) = self.send_control_message(&commit_ack, session).await {
+                        debug!("Inline rekey commit acknowledgement send failed: {}", e);
+                    }
                     // refresh_session_tags is redundant — commit_session_rekey already updates tag_map
                 } else {
                     debug!(
@@ -4458,8 +4505,8 @@ impl Gateway {
                                 cid,
                                 "denied",
                             );
-                            let shutdown = ControlPayload::Shutdown { reason: 4 };
-                            let _ = self.send_control_message(&shutdown, session).await;
+                            let reject = ControlPayload::HandshakeReject { reason: 1 };
+                            let _ = self.send_control_message(&reject, session).await;
                             let session_id = session.lock().session_id;
                             self.session_manager.remove_session(&session_id);
                         }
@@ -4763,6 +4810,12 @@ impl Gateway {
                 // Server→client only; a client should never send this. Ignore.
                 debug!(
                     "Unexpected FeedbackConfig from client {} ignored",
+                    hash_addr(&client_addr)
+                );
+            }
+            ControlPayload::HandshakeReject { .. } => {
+                debug!(
+                    "Unexpected HandshakeReject from client {} ignored",
                     hash_addr(&client_addr)
                 );
             }

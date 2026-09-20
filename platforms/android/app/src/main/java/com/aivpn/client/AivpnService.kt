@@ -768,7 +768,12 @@ class AivpnService : VpnService() {
                         priorOutcomesArg, cachedDescriptorsArg,
                     )
                 }
-                if (error.isNotEmpty()) throw RuntimeException(error)
+                if (error.isNotEmpty()) {
+                    if (error.contains("handshake rejected", ignoreCase = true)) {
+                        throw FatalConfigException(error)
+                    }
+                    throw RuntimeException(error)
+                }
             } finally {
                 // HIGH-1: the native runTunnel returns when stopTunnel() closes the
                 // socket, but on a manual disconnect / service destroy serviceJob is

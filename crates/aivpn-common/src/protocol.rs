@@ -107,6 +107,11 @@ pub enum ControlSubtype {
     /// Server pushes the catalog of masks the client may select, each tagged
     /// with an auto-generated flag so pickers can mark generated masks (0x1F)
     MaskCatalog = 0x1F,
+    /// Authenticated handshake refusal (0x20). Sent only after the peer has
+    /// proven PSK possession (tag match). Unauthenticated probers still get
+    /// silence. `reason`: 1=one-time key already used, 2=expired, 3=disabled,
+    /// 0=unspecified.
+    HandshakeReject = 0x20,
 }
 
 impl ControlSubtype {
@@ -143,8 +148,29 @@ impl ControlSubtype {
             0x1D => Some(Self::RegionalMaskHints),
             0x1E => Some(Self::FeedbackConfig),
             0x1F => Some(Self::MaskCatalog),
+            0x20 => Some(Self::HandshakeReject),
             _ => None,
         }
+    }
+}
+
+/// Human-readable text for a `HandshakeReject` reason code.
+pub fn handshake_reject_message(reason: u8) -> &'static str {
+    match reason {
+        1 => "one-time key already used on another device",
+        2 => "key expired",
+        3 => "client disabled",
+        _ => "unspecified",
+    }
+}
+
+/// Machine-readable token for `AIVPN-STATUS rejected <token>`.
+pub fn handshake_reject_token(reason: u8) -> &'static str {
+    match reason {
+        1 => "one-time-used",
+        2 => "expired",
+        3 => "disabled",
+        _ => "unspecified",
     }
 }
 
@@ -455,6 +481,11 @@ pub enum ControlPayload {
     MaskCatalog {
         masks: Vec<(String, String, bool)>,
     },
+    /// Authenticated refusal after a PSK-proven handshake. See
+    /// `ControlSubtype::HandshakeReject`.
+    HandshakeReject {
+        reason: u8,
+    },
 }
 
 /// Aggregated success/fail outcome counters for a single mask, as reported by
@@ -740,6 +771,10 @@ impl ControlPayload {
                     buf.extend_from_slice(label_bytes);
                     buf.push(if *generated { 1 } else { 0 });
                 }
+            }
+            Self::HandshakeReject { reason } => {
+                buf.push(ControlSubtype::HandshakeReject as u8);
+                buf.push(*reason);
             }
         }
 
@@ -1177,6 +1212,12 @@ impl ControlPayload {
                     report_interval_secs,
                 })
             }
+            ControlSubtype::HandshakeReject => {
+                if data.len() < 2 {
+                    return Err(Error::InvalidPacket("HandshakeReject too short"));
+                }
+                Ok(Self::HandshakeReject { reason: data[1] })
+            }
             ControlSubtype::MaskCatalog => {
                 if data.len() < 2 {
                     return Err(Error::InvalidPacket("MaskCatalog too short"));
@@ -1325,6 +1366,7 @@ mod tests {
             (0x1D, ControlSubtype::RegionalMaskHints),
             (0x1E, ControlSubtype::FeedbackConfig),
             (0x1F, ControlSubtype::MaskCatalog),
+            (0x20, ControlSubtype::HandshakeReject),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1335,7 +1377,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x20), None);
+        assert_eq!(ControlSubtype::from_u8(0x21), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2263,6 +2305,19 @@ mod tests {
     fn control_payload_pool_sync_too_short_returns_error() {
         // only 3 bytes — needs 5 for length prefix
         assert!(ControlPayload::decode(&[0x12, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn control_payload_handshake_reject_roundtrip() {
+        let p = ControlPayload::HandshakeReject { reason: 3 };
+        let decoded = roundtrip(&p);
+        match decoded {
+            ControlPayload::HandshakeReject { reason } => assert_eq!(reason, 3),
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(handshake_reject_token(1), "one-time-used");
+        assert_eq!(handshake_reject_token(2), "expired");
+        assert_eq!(handshake_reject_token(3), "disabled");
     }
 
     #[test]

@@ -223,12 +223,14 @@ impl KillSwitch {
                 .status();
             return;
         }
-        // Fallback: iptables
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+        // Fallback: iptables / ip6tables (whichever family was used)
+        for ipt in ["iptables", "ip6tables"] {
+            let _ = Command::new(ipt)
+                .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
+                .status();
+            let _ = Command::new(ipt).args(["-F", "AIVPN_KS"]).status();
+            let _ = Command::new(ipt).args(["-X", "AIVPN_KS"]).status();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -237,11 +239,13 @@ impl KillSwitch {
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", "aivpn_ks"])
             .status();
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+        for ipt in ["iptables", "ip6tables"] {
+            let _ = Command::new(ipt)
+                .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
+                .status();
+            let _ = Command::new(ipt).args(["-F", "AIVPN_KS"]).status();
+            let _ = Command::new(ipt).args(["-X", "AIVPN_KS"]).status();
+        }
     }
 
     // ──────────────────── macOS ────────────────────
@@ -552,6 +556,20 @@ mod tests {
         assert_eq!(ks.server_ip, "198.51.100.1");
         assert_eq!(ks.tun_name, "utun5");
         assert!(!ks.is_active());
+    }
+
+    #[test]
+    fn nft_ip_family_follows_server_address() {
+        fn family(server_ip: &str) -> &'static str {
+            if server_ip.contains(':') {
+                "ip6"
+            } else {
+                "ip"
+            }
+        }
+        assert_eq!(family("198.51.100.1"), "ip");
+        assert_eq!(family("2001:db8::1"), "ip6");
+        assert_eq!(family("[2001:db8::1]"), "ip6");
     }
 
     #[test]

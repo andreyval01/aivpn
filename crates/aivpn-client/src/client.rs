@@ -497,6 +497,11 @@ pub struct AivpnClient {
     /// connection attempt that never completed the handshake can be attributed
     /// as a mask FAILURE (§2 L2 failure attribution).
     ever_connected: Arc<AtomicBool>,
+    /// Set when the server sent an authenticated `HandshakeReject`. The
+    /// reconnect loop must stop instead of retrying a credential that will
+    /// never be accepted.
+    terminal_rejected: bool,
+    reject_reason: u8,
     /// §3 polymorphic masks — set true once a `MaskUpdate` whose `mask_id`
     /// starts with `polymorphic:` has been applied. The `MaskPreference` retry
     /// task polls this to know when to stop resending (see the ServerHello
@@ -631,6 +636,8 @@ impl AivpnClient {
             mask_success_recorded: false,
             regional_mask_hints: None,
             ever_connected: Arc::new(AtomicBool::new(false)),
+            terminal_rejected: false,
+            reject_reason: 0,
             polymorphic_confirmed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -893,6 +900,14 @@ impl AivpnClient {
     /// FAILURE outcome for the mask it tried to use.
     pub fn ever_connected(&self) -> bool {
         self.ever_connected.load(Ordering::Relaxed)
+    }
+
+    pub fn terminal_rejected(&self) -> bool {
+        self.terminal_rejected
+    }
+
+    pub fn reject_reason(&self) -> u8 {
+        self.reject_reason
     }
 
     async fn apply_server_network_override(
@@ -2775,6 +2790,21 @@ impl AivpnClient {
                 // auto-generated masks "(авто)".
                 info!("MaskCatalog from server: {} masks", masks.len());
                 crate::mask_catalog::write_mask_catalog(&masks);
+            }
+            ControlPayload::HandshakeReject { reason } => {
+                let message = aivpn_common::protocol::handshake_reject_message(reason);
+                error!(
+                    "Handshake rejected by server: {} (reason={})",
+                    message, reason
+                );
+                println!(
+                    "AIVPN-STATUS rejected {}",
+                    aivpn_common::protocol::handshake_reject_token(reason)
+                );
+                self.terminal_rejected = true;
+                self.reject_reason = reason;
+                self.disconnect().await;
+                return Err(Error::Session(format!("handshake rejected: {}", message)));
             }
             _ => {}
         }

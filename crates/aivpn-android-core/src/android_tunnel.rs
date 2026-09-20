@@ -1305,6 +1305,27 @@ pub async fn run_tunnel_android(
                                 break cfg;
                             }
                             Err(e) => {
+                                let mut peek_win = recv_win.clone();
+                                let mut lens = vec![hello_mdh_len, mdh_len, hs_mdh_len];
+                                if let Ok(decoded) = decode_downlink_any_mdh_len(
+                                    &recv_buf[..n],
+                                    &keys,
+                                    &mut peek_win,
+                                    &mut lens,
+                                ) {
+                                    if decoded.header.inner_type == InnerType::Control {
+                                        if let Ok(ControlPayload::HandshakeReject { reason }) =
+                                            ControlPayload::decode(&decoded.payload)
+                                        {
+                                            return Err(Error::Session(format!(
+                                                "handshake rejected: {}",
+                                                aivpn_common::protocol::handshake_reject_message(
+                                                    reason
+                                                )
+                                            )));
+                                        }
+                                    }
+                                }
                                 log::debug!(
                                     "aivpn: non-ServerHello datagram during handshake — ignoring: {e}"
                                 );
@@ -2264,6 +2285,18 @@ pub async fn run_tunnel_android(
                                         log::warn!("aivpn: MaskUpdate decode failed — ignoring");
                                     }
                                 }
+                                ControlPayload::HandshakeReject { reason } => {
+                                    log::error!(
+                                        "aivpn: HandshakeReject from server: reason={} — session terminal",
+                                        reason
+                                    );
+                                    tun_reader_task.abort();
+                                    upload_sender_task.abort();
+                                    return Err(Error::Session(format!(
+                                        "handshake rejected: {}",
+                                        aivpn_common::protocol::handshake_reject_message(reason)
+                                    )));
+                                }
                                 ControlPayload::Shutdown { reason } => {
                                     // Server-initiated teardown — mirror desktop client.rs's
                                     // Shutdown handler: log it and end the session with an error so
@@ -2321,6 +2354,15 @@ pub async fn run_tunnel_android(
 
             // ── RX silence detector (proper interval, not recreated each iteration) ──
             _ = rx_check.tick() => {
+                if transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    transition_recv_keys = None;
+                    transition_recv_deadline = None;
+                    transition_grace_hard = None;
+                    transition_recv_win.reset();
+                    log::info!(
+                        "aivpn: rekey transition timer closed — old RX keys dropped"
+                    );
+                }
                 // Data-plane watchdog: clocked on DATA delivered to the TUN,
                 // not on any decode — a downlink where only keepalive-acks /
                 // KeyRotate retransmits still authenticate is DEAD for the

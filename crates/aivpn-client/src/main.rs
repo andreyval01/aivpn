@@ -1337,6 +1337,16 @@ async fn main() {
                         break;
                     }
                     Err(e) => {
+                        if client.terminal_rejected() {
+                            error!(
+                                "Handshake rejected by server: {} — not retrying",
+                                aivpn_common::protocol::handshake_reject_message(
+                                    client.reject_reason()
+                                )
+                            );
+                            client.deactivate_kill_switch();
+                            break;
+                        }
                         // A connection that stayed up beyond the healthy threshold is
                         // treated as a genuinely established session, so its backoff
                         // resets to the initial value. Without this, a transient drop

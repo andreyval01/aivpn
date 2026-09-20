@@ -392,10 +392,14 @@ pub async fn run_upload_loop(
                     std::future::pending().await
                 }
             } => {
-                if let Some(payload) = maybe_ctrl {
-                    let encrypted = enc.encrypt_control(&payload)?;
-                    send_tolerant(udp, &encrypted).await?;
-                }
+                let payload = match maybe_ctrl {
+                    Some(p) => p,
+                    // A closed channel's recv() is immediately ready with None
+                    // on every poll, so ignoring it spins this select at 100% CPU.
+                    None => return Err(Error::Channel("control channel closed".into())),
+                };
+                let encrypted = enc.encrypt_control(&payload)?;
+                send_tolerant(udp, &encrypted).await?;
             }
         }
     }
@@ -545,5 +549,40 @@ mod tests {
             prefill,
             config.burst_size
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_closed_control_channel_terminates_upload_loop() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client_sock.connect(server_addr).await.unwrap();
+
+        let (_data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        drop(control_tx);
+
+        let mut enc = MarkerEncryptor { next_seq: 0 };
+        let config = UploadConfig::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_upload_loop(
+                &mut data_rx,
+                Some(&mut control_rx),
+                &client_sock,
+                &mut enc,
+                &config,
+                None,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Err(e)) => assert!(
+                e.to_string().contains("control channel closed"),
+                "expected the control-channel-close error, got: {e}"
+            ),
+            Ok(Ok(())) => panic!("run_upload_loop must not return Ok on a closed control channel"),
+            Err(_) => panic!("run_upload_loop did not terminate within 2s — busy-spin regression"),
+        }
     }
 }

@@ -939,6 +939,28 @@ pub async fn run_tunnel_ios(
                 ) {
                     Ok(cfg) => break cfg,
                     Err(e) => {
+                        let mut peek_win = recv_win.clone();
+                        let mut lens = vec![hello_mdh_len, mdh_len, hs_mdh_len];
+                        if let Ok(decoded) = aivpn_common::client_wire::decode_downlink_any_mdh_len(
+                            &recv_buf[..n],
+                            &keys,
+                            &mut peek_win,
+                            &mut lens,
+                        ) {
+                            if decoded.header.inner_type
+                                == aivpn_common::protocol::InnerType::Control
+                            {
+                                if let Ok(aivpn_common::protocol::ControlPayload::HandshakeReject {
+                                    reason,
+                                }) = aivpn_common::protocol::ControlPayload::decode(&decoded.payload)
+                                {
+                                    return Err(Error::Session(format!(
+                                        "handshake rejected: {}",
+                                        aivpn_common::protocol::handshake_reject_message(reason)
+                                    )));
+                                }
+                            }
+                        }
                         log::debug!("aivpn: non-ServerHello datagram during handshake — ignoring: {e}");
                     }
                 }
@@ -1938,6 +1960,18 @@ pub async fn run_tunnel_ios(
                                         threshold, interval
                                     );
                                 }
+                                aivpn_common::protocol::ControlPayload::HandshakeReject { reason } => {
+                                    log::error!(
+                                        "aivpn: HandshakeReject from server: reason={} — session terminal",
+                                        reason
+                                    );
+                                    tun_reader.abort();
+                                    upload_task.abort();
+                                    return Err(Error::Session(format!(
+                                        "handshake rejected: {}",
+                                        aivpn_common::protocol::handshake_reject_message(reason)
+                                    )));
+                                }
                                 aivpn_common::protocol::ControlPayload::Shutdown { reason } => {
                                     // Server-initiated teardown — mirror desktop client.rs's
                                     // Shutdown handler: log it and end the session with an error so
@@ -1993,6 +2027,13 @@ pub async fn run_tunnel_ios(
             }
 
             _ = rx_check.tick() => {
+                if tr_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    tr_keys = None;
+                    tr_deadline = None;
+                    tr_hard = None;
+                    tr_win.reset();
+                    log::info!("aivpn: rekey transition timer closed — old RX keys dropped");
+                }
                 // Data-plane watchdog: clocked on DATA delivered to the TUN,
                 // not on any decode — a downlink where only keepalive-acks /
                 // KeyRotate retransmits still authenticate is DEAD for the
